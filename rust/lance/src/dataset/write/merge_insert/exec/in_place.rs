@@ -25,6 +25,7 @@ use lance_datafusion::exec::LanceExecutionOptions;
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write::WriteParams;
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob, MergeInsertParams, MergeStats,
@@ -64,6 +65,9 @@ pub struct InPlaceMergeInsertExec {
     source_skipped_duplicates: Arc<AtomicU64>,
     spill_session_context: SessionContext,
     spill_execution_options: LanceExecutionOptions,
+    /// The caller's write parameters, for the new fragments `update_fragments`
+    /// would write. Eligibility forbids inserts here, so none are expected.
+    write_params: Arc<WriteParams>,
     update_if_deferred: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -96,6 +100,7 @@ impl InPlaceMergeInsertExec {
         source_skipped_duplicates: Arc<AtomicU64>,
         spill_session_context: SessionContext,
         spill_execution_options: LanceExecutionOptions,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -112,6 +117,7 @@ impl InPlaceMergeInsertExec {
             source_skipped_duplicates,
             spill_session_context,
             spill_execution_options,
+            write_params,
             update_if_deferred: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -418,6 +424,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             spill_session_context: self.spill_session_context.clone(),
             spill_execution_options: self.spill_execution_options.clone(),
+            write_params: self.write_params.clone(),
             update_if_deferred: self.update_if_deferred,
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
@@ -465,6 +472,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let spill_session_context = self.spill_session_context.clone();
         let spill_execution_options = self.spill_execution_options.clone();
+        let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
@@ -485,6 +493,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 &spill_execution_options,
                 (current_version, params.write_version(&dataset)),
                 &params.on,
+                write_params,
             )
             .await?;
 
