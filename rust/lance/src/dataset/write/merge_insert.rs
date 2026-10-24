@@ -163,6 +163,7 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+mod row_ids;
 
 /// Check a merge source against the target schema. As on append, a legacy
 /// blob input matches a Blob v2 target column; the writer converts it.
@@ -3628,11 +3629,25 @@ impl MergeInsertJob {
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let order_updates_first = merger.with_row_id;
         let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
             .try_flatten();
-        let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(merger_schema, stream));
+        let stream = if order_updates_first {
+            row_ids::updates_before_inserts(
+                stream,
+                self.spill_session_context
+                    .runtime_env()
+                    .disk_manager
+                    .clone(),
+            )
+            .await?
+        } else {
+            stream
+        };
 
         // A partial-schema source can patch columns or delete matched rows, but
         // not both in one commit: the writer rejects subschema rows up front and
@@ -3654,7 +3669,7 @@ impl MergeInsertJob {
         let (operation, affected_rows) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
-            let drained: Vec<RecordBatch> = Box::pin(stream).try_collect().await?;
+            let drained: Vec<RecordBatch> = stream.try_collect().await?;
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
@@ -3712,7 +3727,7 @@ impl MergeInsertJob {
                 matched_offsets,
             } = Self::update_fragments(
                 self.dataset.clone(),
-                Box::pin(stream),
+                stream,
                 target_bases_info,
                 &self.spill_session_context,
                 &self.spill_execution_options,
@@ -3750,7 +3765,7 @@ impl MergeInsertJob {
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema().clone(),
-                Box::pin(stream),
+                stream,
                 self.write_params.as_ref().clone(),
                 target_bases_info,
             )
@@ -3764,12 +3779,9 @@ impl MergeInsertJob {
                         .iter()
                         .map(|f| f.physical_rows.unwrap() as u64);
 
-                    // `Merger` captures IDs only for updated rows, while padding below
-                    // assigns fresh IDs at each fragment's tail. The indexed full outer
-                    // hash join must therefore emit every matched update before its
-                    // unmatched build-side inserts. Keep
-                    // `test_multi_batch_upsert_preserves_stable_row_ids` covering this
-                    // DataFusion ordering contract.
+                    // Only updated rows carry IDs. The write stream explicitly
+                    // stages updates before inserts, preserving capture order,
+                    // so commit can assign fresh IDs to each fragment's tail.
                     let sequences = lance_table::rowids::rechunk_sequences(
                         [row_id_sequence.clone()],
                         fragment_sizes,
@@ -4204,6 +4216,8 @@ struct Merger {
     params: MergeInsertParams,
     /// Whether the output schema should include a row address column
     with_row_addr: bool,
+    /// Carry row IDs until full-schema upsert output is ordered for writing.
+    with_row_id: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
@@ -4266,8 +4280,17 @@ impl Merger {
             }
             _ => None,
         };
+        let with_row_id = enable_stable_row_ids
+            && !with_row_addr
+            && params.insert_not_matched
+            && matches!(
+                params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            );
         let output_schema = if with_row_addr {
             Arc::new(schema.try_with_column(ROW_ADDR_FIELD.clone())?)
+        } else if with_row_id {
+            Arc::new(schema.try_with_column(ROW_ID_FIELD.clone())?)
         } else {
             schema
         };
@@ -4280,6 +4303,7 @@ impl Merger {
             match_filter,
             params,
             with_row_addr,
+            with_row_id,
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -4406,7 +4430,8 @@ impl Merger {
             (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
-        let left_cols = Vec::from_iter(0..right_offset);
+        let output_row_col = row_addr_col.or(self.with_row_id.then_some(row_id_col));
+        let output_cols = (0..right_offset).chain(output_row_col).collect::<Vec<_>>();
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
@@ -4536,15 +4561,7 @@ impl Merger {
                                 .capture(row_ids.values())?;
                         }
 
-                        let projection = if let Some(row_addr_col) = row_addr_col {
-                            let mut cols = Vec::from_iter(left_cols.iter().cloned());
-                            cols.push(row_addr_col);
-                            cols
-                        } else {
-                            #[allow(clippy::redundant_clone)]
-                            left_cols.clone()
-                        };
-                        let matched = matched.project(&projection)?;
+                        let matched = matched.project(&output_cols)?;
                         // The payload columns of an outer join are always nullable.  We need to restore
                         // non-nullable to columns that were originally non-nullable.  This should be safe
                         // since the not_matched rows should all be valid on the right_cols
@@ -4578,11 +4595,7 @@ impl Merger {
                         take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
                 }
             }
-            let left_cols_with_id = left_cols
-                .into_iter()
-                .chain(row_addr_col)
-                .collect::<Vec<_>>();
-            let not_matched = not_matched.project(&left_cols_with_id)?;
+            let not_matched = not_matched.project(&output_cols)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
                 self.output_schema.clone(),
@@ -6037,17 +6050,36 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::indexed_slow_path(true)]
-    #[case::full_scan_fast_path(false)]
+    #[case::updates_before_inserts(1, 1, 7, 2)]
+    #[case::insert_batches_before_updates(1000, 1, 0, 256)]
+    #[case::insert_batches_between_updates(128, 256, 0, 1024)]
     #[tokio::test]
-    async fn test_multi_batch_upsert_preserves_stable_row_ids(#[case] use_index: bool) {
-        let mut dataset = (*create_test_dataset(
-            "memory://test_multi_batch_upsert_row_ids",
-            LanceFileVersion::default(),
-            true,
-        )
-        .await)
-            .clone();
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(
+        #[case] first_key: u32,
+        #[case] key_step: u32,
+        #[case] first_insert: u32,
+        #[case] insert_range_len: u32,
+        #[values(true, false)] use_index: bool,
+        #[values(64, 1024)] max_rows_per_file: usize,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().to_str().unwrap();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(first_key, key_step))
+            .col("value", array::fill::<UInt32Type>(1))
+            .col("filterme", array::fill_utf8("original".to_string()))
+            .into_dataset_with_params(
+                uri,
+                FragmentCount(2),
+                FragmentRowCount(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
         dataset
             .create_index(
                 &["key"],
@@ -6060,34 +6092,36 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let initial_keys = [1, 2, 3, 4, 5, 6];
+        let initial_keys = (0..6).map(|i| first_key + i * key_step).collect::<Vec<_>>();
         let initial_row_ids = get_row_ids_for_keys(&dataset, &initial_keys).await;
-        let initial_row_ids = initial_row_ids
-            .values()
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let updated_keys = [2];
-        let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
+        let updated_keys = [initial_keys[1], initial_keys[3]];
+        let inserted_keys = (first_insert..first_insert + insert_range_len)
+            .filter(|key| !initial_keys.contains(key))
+            .collect::<Vec<_>>();
+        let midpoint = inserted_keys.len() / 2;
 
-        // Surround an update with inserts in separate source batches. Stable row-id
-        // assignment still relies on the join emitting the update before both inserts.
+        // Input batch order differs from key order. The indexed join must also
+        // handle entire output batches of inserts before or between updates.
         let first_insert_batch = record_batch!(
-            ("key", UInt32, [7]),
-            ("value", UInt32, [70]),
-            ("filterme", Utf8, ["inserted before"])
+            ("key", UInt32, inserted_keys[..midpoint].to_vec()),
+            ("value", UInt32, vec![70; midpoint]),
+            ("filterme", Utf8, vec!["inserted before"; midpoint])
         )
         .unwrap();
         let update_batch = record_batch!(
-            ("key", UInt32, [2]),
-            ("value", UInt32, [20]),
-            ("filterme", Utf8, ["updated"])
+            ("key", UInt32, updated_keys.to_vec()),
+            ("value", UInt32, [20, 20]),
+            ("filterme", Utf8, ["updated", "updated"])
         )
         .unwrap();
         let second_insert_batch = record_batch!(
-            ("key", UInt32, [8]),
-            ("value", UInt32, [80]),
-            ("filterme", Utf8, ["inserted after"])
+            ("key", UInt32, inserted_keys[midpoint..].to_vec()),
+            ("value", UInt32, vec![80; inserted_keys.len() - midpoint]),
+            (
+                "filterme",
+                Utf8,
+                vec!["inserted after"; inserted_keys.len() - midpoint]
+            )
         )
         .unwrap();
         let source_schema = first_insert_batch.schema();
@@ -6105,23 +6139,45 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::InsertAll)
             .use_index(use_index)
+            .with_params(&WriteParams {
+                max_rows_per_file,
+                ..Default::default()
+            })
             .try_build()
             .unwrap()
             .execute_reader(source)
             .await
             .unwrap();
 
-        assert_eq!(stats.num_updated_rows, 1);
-        assert_eq!(stats.num_inserted_rows, 2);
-        let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
-        assert_eq!(updated_row_ids_after, updated_row_ids_before);
+        assert_eq!(stats.num_updated_rows, updated_keys.len() as u64);
+        assert_eq!(stats.num_inserted_rows, inserted_keys.len() as u64);
+        drop(dataset);
+        let dataset = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            initial_keys.len() + inserted_keys.len()
+        );
+        let row_ids_after = get_row_ids_for_keys(&dataset, &initial_keys).await;
+        assert_eq!(row_ids_after, initial_row_ids);
+        let original_rows = dataset
+            .take_rows(initial_row_ids.values(), dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            original_rows["key"].as_primitive::<UInt32Type>().values(),
+            &initial_keys
+        );
+        assert_eq!(
+            original_rows["value"].as_primitive::<UInt32Type>().values(),
+            &[1, 20, 1, 20, 1, 1]
+        );
 
-        let inserted_row_ids = get_row_ids_for_keys(&dataset, &[7, 8]).await;
+        let inserted_row_ids = get_row_ids_for_keys(&dataset, &inserted_keys).await;
         assert!(
             inserted_row_ids
                 .values()
                 .iter()
-                .all(|row_id| !initial_row_ids.contains(row_id))
+                .all(|row_id| !initial_row_ids.values().contains(row_id))
         );
     }
 

@@ -170,6 +170,8 @@ pub async fn spilling_table_provider_with_job_disk_manager(
                 }
             }
         }
+        // Release upstream execution state before readers can observe completion.
+        drop(source);
         // Only finish on a clean drain. Calling finish() after an error would
         // overwrite the original (replayable) error with a generic one, losing
         // the source error's type (e.g. an external error from user code).

@@ -10,9 +10,10 @@
 
 use std::sync::Arc;
 
+use arrow_array::{cast::AsArray, types::UInt64Type};
 use lance::Dataset;
-use lance::dataset::MergeInsertBuilder;
 use lance::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
+use lance::dataset::{MergeInsertBuilder, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_datagen::{BatchCount, ByteCount, RowCount, Seed, array, gen_batch};
 use lance_index::IndexType;
@@ -31,12 +32,21 @@ const NUM_ROWS: u64 = 8192;
 async fn test_indexed_merge_insert_spills_wide_source() {
     let target = gen_batch()
         .with_seed(Seed::from(1))
-        .col("id", array::step::<arrow_array::types::UInt64Type>())
+        .col("id", array::step_custom::<UInt64Type>(NUM_ROWS, 1))
         .col("payload", array::rand_utf8(ByteCount::from(2048), false))
         .col("updated", array::fill::<arrow_array::types::UInt32Type>(0))
         .into_reader_rows(RowCount::from(NUM_ROWS), BatchCount::from(1));
 
-    let mut dataset = Dataset::write(target, "memory://", None).await.unwrap();
+    let mut dataset = Dataset::write(
+        target,
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     dataset
         .create_index(
             &["id"],
@@ -55,19 +65,21 @@ async fn test_indexed_merge_insert_spills_wide_source() {
 
     // The source is larger than the 16 MiB fair pool. The indexed path
     // must spill instead of collecting it in a non-spillable hash-join input.
+    // Lower-key inserts precede every update in the join, so stable row-ID
+    // preservation must also remain bounded while staging the write order.
     let source: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
         gen_batch()
             .with_seed(Seed::from(2))
             .col("id", array::step::<arrow_array::types::UInt64Type>())
             .col("payload", array::rand_utf8(ByteCount::from(2048), false))
             .col("updated", array::fill::<arrow_array::types::UInt32Type>(1))
-            .into_reader_rows(RowCount::from(NUM_ROWS), BatchCount::from(1)),
+            .into_reader_rows(RowCount::from(NUM_ROWS * 2), BatchCount::from(1)),
     );
 
     let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
         .unwrap()
         .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::DoNothing)
+        .when_not_matched(WhenNotMatched::InsertAll)
         .try_build()
         .unwrap()
         .execute_reader(source)
@@ -75,13 +87,21 @@ async fn test_indexed_merge_insert_spills_wide_source() {
         .unwrap();
 
     assert_eq!(stats.num_updated_rows, NUM_ROWS);
-    assert_eq!(stats.num_inserted_rows, 0);
+    assert_eq!(stats.num_inserted_rows, NUM_ROWS);
     assert_eq!(
         dataset
             .count_rows(Some("updated = 1".to_string()))
             .await
             .unwrap(),
-        NUM_ROWS as usize
+        (NUM_ROWS * 2) as usize
+    );
+    let original_rows = dataset
+        .take_rows(&[0, NUM_ROWS - 1], dataset.schema().clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        original_rows["id"].as_primitive::<UInt64Type>().values(),
+        &[NUM_ROWS, NUM_ROWS * 2 - 1]
     );
 
     unsafe {
